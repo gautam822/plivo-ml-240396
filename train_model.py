@@ -1,109 +1,135 @@
-"""
-train_model.py - fit the final model and save it as portable JSON.
+"""Train the shipped model bundle and export it as portable JSON.
+
+The bundle contains, for each language, a small ensemble of gradient-boosted
+tree models (five seeds, averaged at prediction time - averaging removes the
+run-to-run variance of subsampled boosting), plus an audio-based language
+classifier used when file naming gives no language hint.
 
     python train_model.py --data_dir eot_data --out model.json
-
-Why train on BOTH languages together: the hidden test set is "unseen turns,
-mostly Hindi". Our features are speaker-relative (pitch measured against each
-speaker's own median, energy against their own speech baseline), so combining
-English and Hindi gives the model more examples of the same underlying cues
-without the absolute-scale differences between languages confusing it. Our
-cross-language checks in eval.py confirmed this generalises.
-
-Why export to JSON instead of pickling the sklearn model: the graders run our
-predict.py on THEIR machine, with a possibly different scikit-learn version. A
-pickle can refuse to load across versions. So we read the trees out of the
-fitted model and write them as plain numbers. predict.py then re-implements the
-(very simple) tree math in pure numpy - it does not import sklearn at all. We
-verify the JSON reproduces sklearn's probabilities exactly before saving.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import os
 
 import numpy as np
+from sklearn.ensemble import GradientBoostingClassifier
 
 from dataset import load_folder
+from features import FEATURE_NAMES
 from model import make_model, train_weights
 
+N_SEEDS = 5
 
-def export_boosting_to_json(clf, feature_names):
-    """Pull the decision trees and coefficients out of a fitted
-    GradientBoostingClassifier into a plain dict of Python numbers.
 
-    A gradient-boosted classifier makes a prediction by:
-      raw = init_score + learning_rate * sum(each tree's output)
-      probability = sigmoid(raw)
-    Each tree is a set of nodes; at each node we compare one feature to a
-    threshold and go left or right until we reach a leaf value. That is all the
-    math predict.py needs, so that is all we save.
-    """
+def _init_raw(clf) -> float:
+    prior = float(clf.init_.class_prior_[1])
+    return float(np.log(prior / (1.0 - prior)))
+
+
+def export_boosting(clf) -> dict:
     trees = []
-    for tree_arr in clf.estimators_[:, 0]:          # binary clf -> one tree per round
-        t = tree_arr.tree_
+    for estimator in clf.estimators_[:, 0]:
+        tree = estimator.tree_
         trees.append({
-            "feature": t.feature.tolist(),          # which feature each node tests
-            "threshold": t.threshold.tolist(),      # the value it compares against
-            "left": t.children_left.tolist(),       # node index if test is True
-            "right": t.children_right.tolist(),     # node index if test is False
-            "value": t.value.reshape(-1).tolist(),  # leaf outputs
+            "feature": tree.feature.tolist(),
+            "threshold": tree.threshold.tolist(),
+            "left": tree.children_left.tolist(),
+            "right": tree.children_right.tolist(),
+            "value": tree.value.reshape(-1).tolist(),
         })
     return {
-        "feature_names": list(feature_names),
         "init_score": _init_raw(clf),
         "learning_rate": float(clf.learning_rate),
         "trees": trees,
     }
 
 
-def _init_raw(clf):
-    """The model's starting log-odds before any tree is added."""
-    # GradientBoostingClassifier stores the initial prediction as a log-odds.
-    prior = clf.init_.class_prior_[1]
-    return float(np.log(prior / (1.0 - prior)))
+def fit_language_ensemble(language, X, y, hold_durations):
+    """Five differently-seeded models; predictions are averaged at inference."""
+    blobs, fitted = [], []
+    for seed in range(N_SEEDS):
+        clf = make_model(language)
+        clf.random_state = seed
+        clf.fit(X, y, sample_weight=train_weights(y, hold_durations))
+        blobs.append(export_boosting(clf))
+        fitted.append(clf)
+    return blobs, fitted
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", default="eot_data",
-                    help="folder containing english/ and hindi/ subfolders")
-    ap.add_argument("--out", default="model.json")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", default="eot_data")
+    parser.add_argument("--out", default="model.json")
+    args = parser.parse_args()
 
-    # Gather every language subfolder that actually exists.
-    langs = [d for d in ("english", "hindi")
-             if os.path.isdir(os.path.join(args.data_dir, d))]
-    if not langs:
-        raise SystemExit(f"no english/ or hindi/ folder under {args.data_dir}")
+    data = {}
+    for language in ("english", "hindi"):
+        path = os.path.join(args.data_dir, language)
+        if os.path.isdir(path):
+            data[language] = load_folder(path)
+            print(f"{language}: {len(data[language]['y'])} pauses")
+    if not data:
+        raise SystemExit("No english/ or hindi/ folders found")
 
-    X_parts, y_parts, hd_parts = [], [], []
-    for lang in langs:
-        d = load_folder(os.path.join(args.data_dir, lang))
-        X_parts.append(d["X"])
-        y_parts.append(d["y"])
-        hd_parts.append(d["hold_durations"])
-        print(f"  {lang}: {len(d['y'])} pauses")
-    X = np.vstack(X_parts)
-    y = np.concatenate(y_parts)
-    hd = np.concatenate(hd_parts)
-    print(f"training on {len(y)} pauses from {len(langs)} language(s)")
+    ensembles, fitted = {}, {}
+    for language, d in data.items():
+        ensembles[language], fitted[language] = fit_language_ensemble(
+            language, d["X"], d["y"], d["hold_durations"]
+        )
 
-    from features import FEATURE_NAMES
-    clf = make_model()
-    clf.fit(X, y, sample_weight=train_weights(y, hd))
+    # Audio-based language classifier: prob(hindi) from the same causal
+    # features. Used to softly blend the two language models whenever the
+    # folder/file naming carries no language hint (hidden sets may be named
+    # anything). 0 = english, 1 = hindi.
+    lang_blob = None
+    if len(data) == 2:
+        Xl = np.vstack([data["english"]["X"], data["hindi"]["X"]])
+        yl = np.concatenate([
+            np.zeros(len(data["english"]["y"])),
+            np.ones(len(data["hindi"]["y"])),
+        ])
+        lc = GradientBoostingClassifier(
+            n_estimators=100, max_depth=3, learning_rate=0.1, random_state=0
+        )
+        lc.fit(Xl, yl)
+        lang_blob = export_boosting(lc)
+        fitted["_lang"] = (lc, Xl)
 
-    # Export to JSON and VERIFY it matches sklearn before trusting it.
-    blob = export_boosting_to_json(clf, FEATURE_NAMES)
-    from predict import predict_proba_json      # reuse the exact inference code
-    p_json = predict_proba_json(blob, X)
-    p_sklearn = clf.predict_proba(X)[:, 1]
-    max_diff = float(np.max(np.abs(p_json - p_sklearn)))
-    assert max_diff < 1e-6, f"JSON export mismatch! max diff = {max_diff}"
-    print(f"JSON inference matches sklearn (max diff {max_diff:.2e})")
+    payload = {
+        "schema_version": 3,
+        "feature_names": FEATURE_NAMES,
+        "n_seeds": N_SEEDS,
+        "routing": ("name pattern en__/hi__ or folder name -> that language's "
+                    "ensemble; otherwise soft-blend the two ensembles by the "
+                    "audio language classifier's probability"),
+        "ensembles": ensembles,
+        "language_classifier": lang_blob,
+    }
 
-    with open(args.out, "w") as f:
-        json.dump(blob, f)
-    print(f"saved {args.out}")
+    # Verify portable inference matches sklearn everywhere before saving.
+    from predict import predict_proba_blob, predict_proba_ensemble
+    max_diff = 0.0
+    for language, d in data.items():
+        p_json = predict_proba_ensemble(ensembles[language], d["X"])
+        p_skl = np.mean(
+            [m.predict_proba(d["X"])[:, 1] for m in fitted[language]], axis=0
+        )
+        max_diff = max(max_diff, float(np.max(np.abs(p_json - p_skl))))
+    if lang_blob is not None:
+        lc, Xl = fitted["_lang"]
+        p_json = predict_proba_blob(lang_blob, Xl)
+        p_skl = lc.predict_proba(Xl)[:, 1]
+        max_diff = max(max_diff, float(np.max(np.abs(p_json - p_skl))))
+    if max_diff >= 1e-6:
+        raise RuntimeError(f"JSON inference mismatch: {max_diff}")
+
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    size_mb = os.path.getsize(args.out) / 1e6
+    print(f"saved {args.out} ({size_mb:.1f} MB); "
+          f"max JSON/sklearn difference={max_diff:.2e}")
 
 
 if __name__ == "__main__":

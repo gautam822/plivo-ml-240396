@@ -1,35 +1,36 @@
 # NOTES
 
-1. **Signal used:** for each pause we read only the audio *before* it and
-   measure prosodic end-of-turn cues — pitch slope (in semitones, speaker-
-   relative), energy trailing off vs the speaker's own speech baseline, final-
-   syllable lengthening, breathy/creaky voice quality (spectral tilt), how long
-   the turn has run, and how many times the speaker already paused.
-2. **Why speaker-relative:** absolute pitch and loudness differ by speaker and
-   language, so every cue is measured against that speaker's own running
-   statistics — this is what lets an English-trained signal transfer to Hindi.
-3. **Model:** a small gradient-boosted tree classifier (150 shallow trees) that
-   combines these cues; it is exported to plain JSON and run with pure numpy at
-   prediction time so it cannot break across library versions.
-4. **Key trick:** training samples are weighted by hold length, because the
-   scorer only penalises a false cutoff when the agent fires *before* a long
-   hold ends — so the model learns to be most careful exactly where mistakes
-   cost points.
-5. **Best honest result (out-of-fold):** Hindi — the hidden-test language —
-   improved from a coin-flip (AUC 0.50, ~850 ms) to **AUC 0.70 at ~817 ms**,
-   roughly halving the silence baseline's delay within the 5% interruption
-   budget; English improved from 1600 ms to ~1405 ms.
-6. **Where it fails:** English turn-ends are *not* pitch-marked in this data
-   (verified: eot vs hold pitch-slope separation ≈ 0.05), so English leans on
-   energy and timing and gains less than Hindi.
-7. It also struggles on very early pauses (little audio context) and on
-   hesitant speakers who trail off mid-thought exactly like they do at a real
-   ending.
-8. **Evaluation honesty:** we report out-of-fold numbers; scoring the final
-   model on its own training turns gives a misleading ~250 ms / AUC 0.98, which
-   we deliberately do not claim.
-9. **With one more day:** add a lightweight per-speaker pitch-range calibration,
-   a short sequence model over the pause history within a turn, and a
-   discourse-marker energy feature for English.
-10. Everything runs on a laptop CPU in seconds (~56 ms per pause end to end),
-    matching a real-time voice agent's latency budget.
+1. **Signal:** for each pause the model reads only audio before it and measures
+   prosodic ending cues — pitch slope in semitones (speaker-relative), energy
+   trailing off against an adaptive per-prefix speech baseline, final-syllable
+   and segment-rhythm timing, voice quality (spectral tilt, band energies,
+   flatness, pitch confidence), plus causal turn context (elapsed time,
+   audio-detected prior pauses).
+2. All cues are **speaker- and level-relative** — measured against each
+   prefix's own statistics — which is what lets them transfer across speakers,
+   recording levels, and languages.
+3. **Model:** per-language 5-seed ensembles of small gradient-boosted trees,
+   exported to JSON and run in pure numpy at prediction time (no sklearn
+   import in `predict.py`, so grader-side version mismatches cannot break it).
+4. **Scorer-aware training:** holds shorter than the target action delay get
+   0.1x weight (they cannot cause a false cutoff) and long holds 3x — the
+   model spends its capacity exactly where mistakes cost points.
+5. **Language handling:** English and Hindi get separate models because they
+   mark endings differently (Hindi endings fall in pitch, separation 0.45;
+   English endings don't, 0.05 — found in Run 3); when file naming carries no
+   language hint, an audio-based classifier softly blends the two ensembles,
+   so the hidden set's naming cannot hurt us.
+6. **Best honest result (out-of-fold):** Hindi **698 ms / AUC 0.76** and
+   English **1138 ms / AUC 0.69**, vs the 1600 ms silence baseline; the
+   name-agnostic path scores 742 / 1116 ms.
+7. **Where it still fails:** very early pauses with under a second of context,
+   hesitant speakers whose mid-thought trailing-off mimics a real ending, and
+   English generally — its ending cues are weaker in this data.
+8. A weight-parameter sweep looked promising on fixed folds but every gain
+   vanished across shuffled grouped splits (Run 7), so it was rejected — on
+   200 turns, anything not split-robust is overfitting.
+9. **With one more day:** listen to residual errors, per-speaker online pitch
+   calibration, a small sequence model over each turn's pause history, and
+   probability calibration to stabilise the scorer's threshold sweep.
+10. End-to-end cost is ~31 ms per pause on a laptop CPU — inside a live
+    agent's decision window.

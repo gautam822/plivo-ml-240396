@@ -1,63 +1,55 @@
-"""
-model.py - the classifier and how we weight its training samples.
+"""Language-specific gradient boosting recipes and scorer-aware weights."""
+from __future__ import annotations
 
-Kept tiny and in one place so the two decisions that matter are easy to see:
-
-  make_model()     -> which classifier we use and why.
-  train_weights()  -> our key trick: teach the model to care most about the
-                      mistakes that actually cost points in the scorer.
-"""
 import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier
 
 
-def make_model():
-    """A small gradient-boosted tree classifier.
+def make_model(language: str):
+    """Return the model recipe used for a language.
 
-    Why boosting: our features are a handful of tabular numbers with nonlinear,
-    interacting effects (e.g. falling pitch matters more when energy is also
-    dropping). Trees capture those interactions without us hand-coding them,
-    and a shallow, modest ensemble stays fast on CPU and does not overfit
-    ~250 pauses. Logistic regression was our sanity baseline; boosting beat it.
+    English benefits from smaller leaves; Hindi is more stable with stronger
+    leaf regularisation. Both are deliberately small CPU models.
     """
+    language = language.lower()
+    if language == "english":
+        return GradientBoostingClassifier(
+            n_estimators=150,
+            max_depth=3,
+            min_samples_leaf=5,
+            learning_rate=0.05,
+            subsample=0.8,
+            random_state=0,
+        )
+    if language == "hindi":
+        return GradientBoostingClassifier(
+            n_estimators=120,
+            max_depth=3,
+            min_samples_leaf=15,
+            learning_rate=0.05,
+            subsample=0.8,
+            random_state=0,
+        )
     return GradientBoostingClassifier(
-        n_estimators=150,
+        n_estimators=130,
         max_depth=3,
+        min_samples_leaf=10,
         learning_rate=0.05,
-        subsample=0.8,        # a little randomness -> less overfitting
+        subsample=0.8,
         random_state=0,
     )
 
 
-def train_weights(y, hold_durations):
-    """Weight each training pause by how much a mistake on it would cost.
+def train_weights(y, hold_durations, target_delay=0.60):
+    """Approximate the official objective during training.
 
-    This is the heart of what we add beyond an off-the-shelf classifier, and it
-    comes straight from reading the scorer:
-
-      * A HOLD pause only causes a "false cutoff" if the agent's silence delay
-        is SHORTER than the pause. Long holds are the dangerous ones: the user
-        goes quiet long enough that a hasty agent barges in. Short holds are
-        almost harmless. So we weight a hold by its length -> the model works
-        hardest to avoid firing on the long holds that actually lose points.
-
-      * EOT pauses all matter equally (each is one chance to respond quickly),
-        so they get a flat weight.
-
-    Causality note: pause length is used ONLY as a training weight, never as a
-    model input. At prediction time the model never sees it. Weighting training
-    samples by label-derived information is standard and allowed - the causality
-    rule governs what the model may look at when making a live decision.
-
-    Args:
-        y              array of 0/1 labels (1 = eot).
-        hold_durations array the same length as y; for hold rows it holds the
-                       pause length in seconds, for eot rows the value is ignored.
+    A hold shorter than the target action delay cannot create a cutoff, so it
+    gets little weight. A hold longer than the target delay is dangerous and
+    gets much more weight. EOT examples retain unit weight.
     """
-    w = np.ones(len(y), dtype=np.float32)
-    w[y == 1] = 1.0                       # eot rows: uniform weight
-    # hold rows: weight grows with pause length, capped so no single long hold
-    # dominates. A 0.1 s hold ~ weight 1; a >=1.5 s hold ~ weight 3.
+    y = np.asarray(y)
+    hold_durations = np.asarray(hold_durations)
+    w = np.ones(len(y), dtype=np.float64)
     hold = y == 0
-    w[hold] = 1.0 + 2.0 * np.clip(hold_durations[hold] / 1.5, 0.0, 1.0)
+    w[hold] = np.where(hold_durations[hold] > target_delay, 3.0, 0.1)
     return w
